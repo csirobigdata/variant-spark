@@ -1,41 +1,51 @@
 package au.csiro.variantspark.cli
-
 import au.csiro.pbdava.ssparkle.common.arg4j.{AppRunner, TestArgs}
-import au.csiro.pbdava.ssparkle.common.utils.{CSVUtils, Logging, ReusablePrintStream, Timer}
+import au.csiro.pbdava.ssparkle.common.utils.{Logging, Timer}
 import au.csiro.pbdava.ssparkle.spark.{SparkApp, SparkUtils}
 import au.csiro.sparkle.common.args4j.ArgsApp
-import au.csiro.variantspark.algo.{RandomForest, RandomForestCallback, RandomForestParams, _}
-import au.csiro.variantspark.cli.args.{
-  FeatureSourceArgs,
-  ImportanceArgs,
-  ModelOutputArgs,
-  RandomForestArgs
+import au.csiro.variantspark.algo.{
+  DefTreeRepresentationFactory,
+  RandomForest,
+  RandomForestCallback,
+  RandomForestParams
 }
+import au.csiro.variantspark.cli.args._
 import au.csiro.variantspark.cmd.EchoUtils._
 import au.csiro.variantspark.cmd.Echoable
 import au.csiro.variantspark.input.CsvLabelSource
-import au.csiro.variantspark.utils.{HdfsPath, defRng}
+import au.csiro.variantspark.utils.defRng
 import org.apache.commons.lang3.builder.ToStringBuilder
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.FileSystem
+import org.apache.spark.serializer.{JavaSerializer, SerializerInstance}
 import org.kohsuke.args4j.Option
 
-class ImportanceCmd
-    extends ArgsApp with SparkApp with FeatureSourceArgs with ImportanceArgs with RandomForestArgs
-    with ModelOutputArgs with Echoable with Logging with TestArgs {
+class TrainRFCmd
+    extends ArgsApp with SparkApp with LabelSourceArgs with RandomForestArgs with ImportanceArgs
+    with FeatureSourceArgs with ModelOutputArgs with Echoable with Logging with TestArgs {
 
-  @Option(name = "-ff", required = true, usage = "Path to feature file",
-    aliases = Array("--feature-file"))
-  val featuresFile: String = null
-
-  @Option(name = "-fc", required = true, usage = "Name of the feature column",
-    aliases = Array("--feature-column"))
-  val featureColumn: String = null
-
-  // output options
   @Option(name = "-of", required = false, usage = "Path to output file (def = stdout)",
     aliases = Array("--output-file"))
   val outputFile: String = null
+
+  @Option(name = "-im", required = false, usage = "Path to input model",
+    aliases = Array("--input-model"))
+  val inputModel: String = null
+
+  @Option(name = "-ii", required = false, usage = "Path to input variable index file",
+    aliases = Array("--input-index"))
+  val inputIndex: String = null
+
+  @Option(name = "-lf", required = false, usage = "Path to label file",
+    aliases = Array("--label-file"))
+  val labelFile: String = null
+
+  @Option(name = "-lc", required = false, usage = "Label file column name",
+    aliases = Array("--label-column"))
+  val labelColumn: String = null
+
+  @Option(name = "-sr", required = false, usage = "Random seed to use (def=<random>)",
+    aliases = Array("--seed"))
+  val randomSeed: Long = defRng.nextLong
 
   @Option(name = "-on", required = false,
     usage = "The number of top important variables to include in output."
@@ -48,22 +58,14 @@ class ImportanceCmd
     aliases = Array("--output-include-data"))
   val includeData: Boolean = false
 
-  @Option(name = "-sr", required = false, usage = "Random seed to use (def=<random>)",
-    aliases = Array("--seed"))
-  val randomSeed: Long = defRng.nextLong
+  val javaSerializer = new JavaSerializer(conf)
+  val si: SerializerInstance = javaSerializer.newInstance()
 
   override def testArgs: Array[String] =
-    Array("-if", "data/chr22_1000.vcf", "-ff", "data/chr22-labels.csv", "-fc", "22_16051249",
-      "-ovn", "raw", "-on", "1988", "-rn", "1000", "-rbs", "100", "-ic", "-om",
-      "target/ch22-model.json", "-omf", "json", "-sr", "13", "-v", "-io", """{"separator":":"}""")
+    Array("-im", "file.model", "-if", "file.data", "-of", "outputpredictions.file")
 
   override def run(): Unit = {
-    implicit val fs: FileSystem = FileSystem.get(sc.hadoopConfiguration)
     implicit val hadoopConf: Configuration = sc.hadoopConfiguration
-    logDebug(s"Running with filesystem: ${fs}, home: ${fs.getHomeDirectory}")
-    logInfo("Running with params: " + ToStringBuilder.reflectionToString(this))
-
-    echo(s"Finding  ${nVariables}  most important features using random forest")
 
     val dataLoadingTimer = Timer()
     echo(s"Loaded rows: ${dumpList(featureSource.sampleNames)}")
@@ -78,13 +80,6 @@ class ImportanceCmd
         + s" took: ${dataLoadingTimer.durationInSec}")
     echoDataPreview()
 
-    // if (isVerbose) {
-    //  verbose("Representation preview:")
-    //  inputData.take(defaultPreviewSize).foreach(f=> verbose(s"${f.label}:
-    //  ${f.variableType}:${dumpList(f.valueAsStrings,
-    //  longPreviewSize)}(${f.getClass.getName})"))
-    // }
-
     echo(s"Loading labels from: ${featuresFile}, column: ${featureColumn}")
     val labelSource = new CsvLabelSource(featuresFile, featureColumn)
     val labels = labelSource.getLabels(featureSource.sampleNames)
@@ -97,8 +92,6 @@ class ImportanceCmd
         bootstrap = !rfSampleNoReplacement, subsample = rfSubsampleFraction,
         nTryFraction = if (rfMTry > 0) rfMTry.toDouble / totalVariables else rfMTryFraction,
         correctImpurity = correctImportance, airRandomSeed = airRandomSeed))
-
-    //
     val trainingData = inputData
 
     implicit val rfCallback: RandomForestCallback = new RandomForestCallback() {
@@ -118,7 +111,6 @@ class ImportanceCmd
         echo(
             s"Last build trees: ${nTrees}, time: ${elapsedTimeMs} ms,"
               + s" timePerTree: ${elapsedTimeMs / nTrees} ms")
-
       }
     }
 
@@ -150,35 +142,20 @@ class ImportanceCmd
       case (i, importance) => (index(i), importance)
     })
 
-    if (isEcho && outputFile != null) {
-      echo("Variable importance preview")
-      varImportance
-        .take(math.min(math.max(nVariables, defaultPreviewSize), defaultPreviewSize))
-        .foreach({ case (label, importance) => echo(s"${label}: ${importance}") })
-    }
+    println("running train cmd")
+    logInfo("Running with params: " + ToStringBuilder.reflectionToString(this))
+    echo(s"Analyzing random forest model")
+    echo(s"Using spark RF Model: ${result.toString}")
+    echo(s"Using labels: ${labels}")
+    echo(s"Loaded rows: ${dumpList(featureSource.sampleNames)}")
 
-    val importantVariableData =
-      if (includeData) trainingData.collectAtIndexes(topImportantVariableIndexes) else null
-
-    CSVUtils.withStream(
-        if (outputFile != null) HdfsPath(outputFile).create() else ReusablePrintStream.stdout) {
-      writer =>
-        val header =
-          List("variable", "importance") ::: (if (includeData) featureSource.sampleNames else Nil)
-        writer.writeRow(header)
-        writer.writeAll(topImportantVariables.map({
-          case (i, importance) =>
-            List(index(i), importance) ::: (if (includeData) {
-                                              importantVariableData(i).valueAsStrings
-                                            } else { Nil })
-        }))
-    }
     saveModel(result, index.toMap)
+    echo(s"inputFile: ${inputFile}")
   }
 }
 
-object ImportanceCmd {
+object TrainRFCmd {
   def main(args: Array[String]) {
-    AppRunner.mains[ImportanceCmd](args)
+    AppRunner.mains[TrainRFCmd](args)
   }
 }
